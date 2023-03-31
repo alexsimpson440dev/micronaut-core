@@ -25,6 +25,7 @@ import io.micronaut.core.execution.ExecutionFlow;
 import io.micronaut.core.execution.ImperativeExecutionFlow;
 import io.micronaut.core.order.OrderUtil;
 import io.micronaut.core.order.Ordered;
+import io.micronaut.core.propagation.PropagatedContext;
 import io.micronaut.core.type.Argument;
 import io.micronaut.core.type.Executable;
 import io.micronaut.http.HttpRequest;
@@ -86,6 +87,7 @@ public class FilterRunner {
     private final List<GenericHttpFilter> filters;
 
     private Context initialReactorContext = Context.empty();
+    private PropagatedContext initialPropagatedContext = PropagatedContext.get();
 
     /**
      * Create a new filter runner, to be used only once.
@@ -174,7 +176,7 @@ public class FilterRunner {
      */
     @SuppressWarnings("java:S1452")
     public final ExecutionFlow<MutableHttpResponse<?>> run(HttpRequest<?> request) {
-        return (ExecutionFlow) filterRequest(new FilterContext(request, initialReactorContext), filters.listIterator(), new HashMap<>());
+        return (ExecutionFlow) filterRequest(new FilterContext(request, initialReactorContext, initialPropagatedContext), filters.listIterator(), new HashMap<>());
     }
 
     private ExecutionFlow<HttpResponse<?>> filterRequest(FilterContext context,
@@ -301,7 +303,12 @@ public class FilterRunner {
             ExecutionFlow<R> downstreamFlow = downstream.apply(chainSuspensionPoint.nextFilterFlow());
             if (executeOn == null) {
                 try {
-                    around.bean().doFilter(context.request, chainSuspensionPoint).subscribe(chainSuspensionPoint);
+                    context.propagatedContext().propagate(() -> {
+                        doSubscribe(
+                            around.bean().doFilter(context.request, chainSuspensionPoint),
+                            chainSuspensionPoint
+                        );
+                    }).run();
                 } catch (Throwable e) {
                     chainSuspensionPoint.triggerFilterProcessed(context, null, e);
                 }
@@ -309,7 +316,12 @@ public class FilterRunner {
             } else {
                 return ExecutionFlow.async(executeOn, () -> {
                     try {
-                        around.bean().doFilter(context.request, chainSuspensionPoint).subscribe(chainSuspensionPoint);
+                        context.propagatedContext().propagate(() -> {
+                            doSubscribe(
+                                around.bean().doFilter(context.request, chainSuspensionPoint),
+                                chainSuspensionPoint
+                            );
+                        }).run();
                     } catch (Throwable e) {
                         chainSuspensionPoint.triggerFilterProcessed(context, null, e);
                     }
@@ -331,10 +343,12 @@ public class FilterRunner {
                     terminalFlow = ExecutionFlow.error(e);
                 }
             } else if (filter instanceof GenericHttpFilter.Terminal t) {
-                try {
-                    terminalFlow = t.execute(context.request);
-                } catch (Throwable e) {
-                    terminalFlow = ExecutionFlow.error(e);
+                try (PropagatedContext.InContext ignore = context.propagatedContext.propagate()) {
+                    try {
+                        terminalFlow = t.execute(context.request);
+                    } catch (Throwable e) {
+                        terminalFlow = ExecutionFlow.error(e);
+                    }
                 }
             } else {
                 terminalFlow = ReactiveExecutionFlow.fromPublisher(Mono.from(((GenericHttpFilter.TerminalReactive) filter).responsePublisher())
@@ -343,6 +357,14 @@ public class FilterRunner {
             return downstream.apply(terminalFlow.flatMap(response -> ExecutionFlow.just(context.withResponse(response))));
         } else {
             throw new IllegalStateException("Unknown filter type");
+        }
+    }
+
+    private <T> void doSubscribe(Publisher<T> publisher, Subscriber<? super T> subscriber) {
+        if (publisher instanceof CorePublisher<? extends T> corePublisher && subscriber instanceof CoreSubscriber<? super  T> coreSubscriber) {
+            corePublisher.subscribe(coreSubscriber);
+        } else {
+            publisher.subscribe(subscriber);
         }
     }
 
@@ -839,7 +861,9 @@ public class FilterRunner {
 
         @Override
         public FilterContinuation<R> request(HttpRequest<?> request) {
-            filterContext = filterContext.withRequest(Objects.requireNonNull(request, "request"));
+            filterContext = filterContext
+                .withRequest(Objects.requireNonNull(request, "request"))
+                .withPropagatedContext(PropagatedContext.get());
             return this;
         }
 
@@ -975,10 +999,11 @@ public class FilterRunner {
 
     private record FilterContext(HttpRequest<?> request,
                                  @Nullable HttpResponse<?> response,
-                                 Context reactorContext) {
+                                 Context reactorContext,
+                                 PropagatedContext propagatedContext) {
 
-        FilterContext(HttpRequest<?> request, Context reactorContext) {
-            this(request, null, reactorContext);
+        FilterContext(HttpRequest<?> request, Context reactorContext, PropagatedContext propagatedContext) {
+            this(request, null, reactorContext, propagatedContext);
         }
 
         public FilterContext withRequest(@NonNull HttpRequest<?> request) {
@@ -989,7 +1014,7 @@ public class FilterRunner {
                 throw new IllegalStateException("Cannot modify the request after response is set!");
             }
             Objects.requireNonNull(request);
-            return new FilterContext(request, response, reactorContext);
+            return new FilterContext(request, response, reactorContext, propagatedContext);
         }
 
         public FilterContext withResponse(@NonNull HttpResponse<?> response) {
@@ -998,7 +1023,7 @@ public class FilterRunner {
             }
             Objects.requireNonNull(response);
             // New response should remove the failure
-            return new FilterContext(request, response, reactorContext);
+            return new FilterContext(request, response, reactorContext, propagatedContext);
         }
 
         public FilterContext withReactorContext(@NonNull Context reactorContext) {
@@ -1006,7 +1031,15 @@ public class FilterRunner {
                 return this;
             }
             Objects.requireNonNull(reactorContext);
-            return new FilterContext(request, response, reactorContext);
+            return new FilterContext(request, response, reactorContext, propagatedContext);
+        }
+
+        public FilterContext withPropagatedContext(@NonNull PropagatedContext propagatedContext) {
+            if (this.propagatedContext == propagatedContext) {
+                return this;
+            }
+            Objects.requireNonNull(propagatedContext);
+            return new FilterContext(request, response, reactorContext, propagatedContext);
         }
 
     }
